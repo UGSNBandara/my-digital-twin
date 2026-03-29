@@ -22,12 +22,13 @@ import numpy as np
 import faiss
 import requests
 from openai import AsyncOpenAI
-from sentence_transformers import SentenceTransformer
 
 from knowledge import DOCUMENTS
 import session as session_store
 
 logger = logging.getLogger(__name__)
+
+EMBED_MODEL = "text-embedding-3-small"  # fast, cheap, 1536-dim
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OPENAI_MODEL   = "gpt-4o-mini"
@@ -135,23 +136,32 @@ class SulithaAgent:
         self.name   = "Sulitha Nulaksha Bandara"
         self.openai = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-        logger.info("Loading sentence-transformer model...")
-        self._embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-        logger.info(f"Embedding {len(DOCUMENTS)} knowledge chunks...")
+        logger.info(f"Embedding {len(DOCUMENTS)} knowledge chunks via OpenAI...")
         self._doc_chunks = DOCUMENTS
-        embeddings = self._embedder.encode(DOCUMENTS, convert_to_numpy=True, show_progress_bar=False)
-        embeddings = embeddings.astype(np.float32)
+        embeddings = self._embed_texts(DOCUMENTS)
 
         dim = embeddings.shape[1]
         self._index = faiss.IndexFlatL2(dim)
         self._index.add(embeddings)
         logger.info(f"FAISS index built: {self._index.ntotal} vectors, dim={dim}")
 
+    # ── Embeddings (OpenAI) ───────────────────────────────────────────────────
+
+    def _embed_texts(self, texts: list[str]) -> np.ndarray:
+        """Embed a list of texts using OpenAI embeddings. Returns float32 array."""
+        # Use a sync client just for the startup index build
+        from openai import OpenAI as SyncOpenAI
+        client = SyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        response = client.embeddings.create(model=EMBED_MODEL, input=texts)
+        vecs = np.array([d.embedding for d in response.data], dtype=np.float32)
+        return vecs
+
     # ── RAG ───────────────────────────────────────────────────────────────────
 
-    def _retrieve(self, query: str, k: int = TOP_K_CHUNKS) -> str:
-        q_vec = self._embedder.encode([query], convert_to_numpy=True).astype(np.float32)
+    async def _retrieve(self, query: str, k: int = TOP_K_CHUNKS) -> str:
+        """Embed query via OpenAI, search FAISS, return top-k chunks."""
+        response = await self.openai.embeddings.create(model=EMBED_MODEL, input=[query])
+        q_vec = np.array([response.data[0].embedding], dtype=np.float32)
         _, idxs = self._index.search(q_vec, k)
         chunks = [self._doc_chunks[i] for i in idxs[0] if i < len(self._doc_chunks)]
         return "\n\n---\n\n".join(chunks)
@@ -198,7 +208,7 @@ class SulithaAgent:
         if session_store.is_over_limit(session_id):
             return SESSION_LIMIT_REPLY
 
-        rag_context = self._retrieve(message)
+        rag_context = await self._retrieve(message)
         history     = session_store.get_history(session_id)
 
         messages = (
