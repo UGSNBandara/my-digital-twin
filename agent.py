@@ -24,6 +24,7 @@ Agent design:
 """
 
 import os
+import re
 import json
 import logging
 import numpy as np
@@ -64,14 +65,17 @@ Rules the reply MUST follow:
    tildes (~), or any other markdown syntax. Plain text only.
 2. No emojis or special Unicode symbols.
 3. Only English letters, numbers, and standard punctuation (.,!?;:'-) are allowed.
-4. Concise — maximum 4 sentences. Short answers are preferred.
+4. Concise — maximum 60 words. Default should be 1-2 sentences.
+   If the topic is large, the reply must summarise briefly and offer to go deeper,
+   not dump everything at once.
 5. Never breaks character — must not say "As an AI", "I am a language model",
    "I don't have feelings", or anything that reveals it is not Sulitha.
 6. Never fabricates information — must not claim skills, projects, awards, or facts
    that are not in the provided profile.
 7. Stays on topic — only discusses Sulitha's career, projects, skills, education,
    research, and availability. Politely redirects off-topic questions.
-8. Professional and friendly tone — no slang, no overly casual language.
+8. Professional and friendly tone — warm but not stiff. No slang, no overly casual
+   language, but also no corporate formality like "Greetings" or "How may I assist you".
 
 Return is_acceptable as true only if ALL rules pass.
 If any rule fails, set is_acceptable to false and explain exactly which rule failed
@@ -91,6 +95,20 @@ def _evaluator_user_prompt(reply: str, message: str) -> str:
 class Evaluation(BaseModel):
     is_acceptable: bool
     feedback: str
+
+
+# ── Hard character cleaner ───────────────────────────────────────────────────
+# Runs on every reply BEFORE evaluation — strips forbidden chars regardless of
+# what the LLM produced. Evaluator then catches anything logic-based (tone, facts, etc.)
+
+def _clean_reply(text: str) -> str:
+    # Remove markdown syntax characters
+    text = re.sub(r'[*#_`~]', '', text)
+    # Remove emojis and all non-ASCII characters
+    text = re.sub(r'[^\x20-\x7E]', '', text)
+    # Collapse multiple spaces left by removals
+    text = re.sub(r' {2,}', ' ', text).strip()
+    return text
 
 
 # ── Pushover helper ───────────────────────────────────────────────────────────
@@ -265,13 +283,21 @@ class SulithaAgent:
 
     def _system_prompt(self) -> str:
         return (
-            f"You are acting as {self.name}, speaking directly with visitors on your "
-            f"personal portfolio website. Answer questions about your career, projects, "
-            f"skills, and background. Be professional, engaging, and concise.\n\n"
-            f"If a visitor asks about a specific project, call get_project_details. "
-            f"If they describe something without naming a project, call search_projects. "
-            f"If you genuinely cannot answer something, call record_unknown_question. "
-            f"If a visitor seems interested in getting in touch, ask for their email and "
+            f"You are {self.name}, chatting casually with visitors on your portfolio site.\n\n"
+            f"Tone rules:\n"
+            f"- Talk like a normal, friendly person. Short and natural, not formal.\n"
+            f"- Visitors are already on your portfolio — they know who you are. Never introduce yourself unprompted.\n"
+            f"- If someone just says hi or hello, reply with a short warm greeting and offer to help. Nothing else.\n"
+            f"- Never mention you are a third-year student, from Sri Lanka, or any other bio detail unless directly asked.\n"
+            f"- Never say things like 'Greetings', 'Thank you for visiting', 'How may I assist you'.\n"
+            f"- By default reply in 1-2 sentences. Only expand if the visitor clearly wants detail.\n"
+            f"- If a topic has a lot of detail, give a short summary and end with something like "
+            f"'want me to go deeper on any part?' — do not dump everything at once.\n\n"
+            f"Tool rules:\n"
+            f"- If a visitor asks about a specific project, call get_project_details.\n"
+            f"- If they describe something without naming a project, call search_projects.\n"
+            f"- If you cannot answer something, call record_unknown_question.\n"
+            f"- If a visitor seems interested in getting in touch, ask for their email and "
             f"call record_user_details.\n\n"
             f"## Your Profile\n{PROFILE_SUMMARY}"
         )
@@ -314,7 +340,8 @@ class SulithaAgent:
             f"Feedback: {feedback}\n\n"
             f"Previous reply: {reply}\n\n"
             f"Please rewrite the reply fixing all issues mentioned in the feedback. "
-            f"Remember: plain text only, no markdown, no emojis, maximum 4 sentences."
+            f"Remember: plain text only, no markdown, no emojis, maximum 60 words, "
+            f"casual friendly tone, never formal greetings."
         )
         messages = (
             [{"role": "system", "content": self._system_prompt()}]
@@ -329,7 +356,7 @@ class SulithaAgent:
             max_tokens  = MAX_TOKENS,
             temperature = 0.3,   # lower temp for correction pass
         )
-        return response.choices[0].message.content.strip()
+        return _clean_reply(response.choices[0].message.content)
 
     # ── Main chat ─────────────────────────────────────────────────────────────
 
@@ -369,7 +396,7 @@ class SulithaAgent:
                 "Feel free to email me directly at nulakshastudy19@gmail.com."
             )
 
-        reply = response.choices[0].message.content.strip()
+        reply = _clean_reply(response.choices[0].message.content)
 
         # 2. Evaluate and rerun if needed
         try:
