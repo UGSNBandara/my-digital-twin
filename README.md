@@ -44,7 +44,7 @@ Top-3 relevant chunks are injected into the system prompt for each message.
 
 | Variable             | Required | Purpose                        |
 |----------------------|----------|--------------------------------|
-| OPENAI_API_KEY       | Yes      | GPT-4o-mini calls              |
+| OPENAI_API_KEY       | Yes      | GPT-4o-mini + gpt-4.1-nano + embeddings |
 | PORTFOLIO_SECRET_KEY | Yes      | Must match Vercel env var      |
 | PUSHOVER_TOKEN       | Optional | Phone notifications            |
 | PUSHOVER_USER        | Optional | Phone notifications            |

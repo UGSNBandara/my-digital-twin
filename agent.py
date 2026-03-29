@@ -1,18 +1,26 @@
 """
 agent.py
 ========
-Core agent logic using real OpenAI function calling:
-  1. Build FAISS index from knowledge.py at startup
-  2. For each message:
-       a. Check session cap
-       b. RAG: embed query → FAISS top-3 chunks
-       c. Build prompt and call OpenAI with tools
-       d. Loop: handle tool calls until finish_reason != "tool_calls"
-       e. Save to session and return reply
+Agent design:
 
-Tools:
-  - record_user_details  → notify via Pushover when a user shares their email
-  - record_unknown_question → notify via Pushover when a question can't be answered
+  ALWAYS in every prompt:
+    - profile_summary.py  →  full profile, skills, contact, ~200 tokens flat cost
+
+  Tools (real OpenAI function calling):
+    - get_project_details(names)   direct lookup by name — used when LLM knows which project
+    - search_projects(description) FAISS semantic search — fallback when LLM only has a description
+    - record_user_details          Pushover notification when visitor shares email
+    - record_unknown_question      Pushover notification when a question can't be answered
+
+  FAISS index:
+    - Built ONCE at startup over project search_text fields only (6 small strings)
+    - Never rebuilt per request
+    - Query embeddings called per search_projects tool call only
+
+  Response validation:
+    - After every reply, Gemini evaluates it against quality rules
+    - If it fails, GPT-4o-mini reruns with the feedback to produce a fixed reply
+    - Uses structured output (Pydantic Evaluation model) via Gemini OpenAI-compat endpoint
 """
 
 import os
@@ -21,20 +29,22 @@ import logging
 import numpy as np
 import faiss
 import requests
-from openai import AsyncOpenAI
+from pydantic import BaseModel
+from openai import AsyncOpenAI, OpenAI
 
-from knowledge import DOCUMENTS
+from profile_summary import PROFILE_SUMMARY
+from projects_data import get_by_names, get_all_search_texts
 import session as session_store
 
 logger = logging.getLogger(__name__)
 
-EMBED_MODEL = "text-embedding-3-small"  # fast, cheap, 1536-dim
-
 # ── Config ────────────────────────────────────────────────────────────────────
 OPENAI_MODEL   = "gpt-4o-mini"
-TOP_K_CHUNKS   = 3
-MAX_TOKENS     = 400
+EVAL_MODEL     = "gpt-4.1-nano"
+EMBED_MODEL    = "text-embedding-3-small"
+MAX_TOKENS     = 500
 TEMPERATURE    = 0.7
+DEFAULT_TOP_N  = 3
 
 SESSION_LIMIT_REPLY = (
     "We've hit the limit for this chat session — I'd love to keep the conversation "
@@ -42,11 +52,50 @@ SESSION_LIMIT_REPLY = (
     "me on LinkedIn: linkedin.com/in/nulaksha-bandara"
 )
 
+# ── Evaluator prompts ─────────────────────────────────────────────────────────
 
-# ── Tool functions ────────────────────────────────────────────────────────────
+EVALUATOR_SYSTEM_PROMPT = """
+You are a strict quality checker for an AI agent that represents Sulitha Nulaksha Bandara
+on his personal portfolio website. Your job is to evaluate whether the agent's reply
+meets all the rules below. Be precise and critical.
+
+Rules the reply MUST follow:
+1. No markdown formatting — no asterisks (*), hashes (#), underscores (_), backticks (`),
+   tildes (~), or any other markdown syntax. Plain text only.
+2. No emojis or special Unicode symbols.
+3. Only English letters, numbers, and standard punctuation (.,!?;:'-) are allowed.
+4. Concise — maximum 4 sentences. Short answers are preferred.
+5. Never breaks character — must not say "As an AI", "I am a language model",
+   "I don't have feelings", or anything that reveals it is not Sulitha.
+6. Never fabricates information — must not claim skills, projects, awards, or facts
+   that are not in the provided profile.
+7. Stays on topic — only discusses Sulitha's career, projects, skills, education,
+   research, and availability. Politely redirects off-topic questions.
+8. Professional and friendly tone — no slang, no overly casual language.
+
+Return is_acceptable as true only if ALL rules pass.
+If any rule fails, set is_acceptable to false and explain exactly which rule failed
+and what needs to change in the feedback field.
+""".strip()
+
+
+def _evaluator_user_prompt(reply: str, message: str) -> str:
+    return (
+        f"User message: {message}\n\n"
+        f"Agent reply to evaluate:\n{reply}"
+    )
+
+
+# ── Evaluation model ──────────────────────────────────────────────────────────
+
+class Evaluation(BaseModel):
+    is_acceptable: bool
+    feedback: str
+
+
+# ── Pushover helper ───────────────────────────────────────────────────────────
 
 def _push(text: str) -> None:
-    """Send a Pushover notification. Silently skips if tokens are not set."""
     token = os.getenv("PUSHOVER_TOKEN")
     user  = os.getenv("PUSHOVER_USER")
     if not token or not user:
@@ -62,73 +111,122 @@ def _push(text: str) -> None:
         logger.warning(f"Pushover notification failed: {e}")
 
 
+# ── Tool functions ────────────────────────────────────────────────────────────
+
+def get_project_details(names: list[str]) -> dict:
+    """Direct project lookup by name. Fast — no embedding needed."""
+    return {"result": get_by_names(names)}
+
+
+def search_projects(description: str, top_n: int = DEFAULT_TOP_N) -> dict:
+    """
+    Semantic FAISS search over project search_text fields.
+    Fallback tool — used when LLM has a description but not a project name.
+    """
+    return {"result": _agent.faiss_search(description, top_n)}
+
+
 def record_user_details(email: str, name: str = "Name not provided", notes: str = "not provided") -> dict:
-    """Record that a visitor shared their email and wants to stay in touch."""
     _push(f"Portfolio visitor: {name} | email: {email} | notes: {notes}")
     return {"recorded": "ok"}
 
 
 def record_unknown_question(question: str) -> dict:
-    """Record a question the agent could not answer."""
     _push(f"Unanswered question on portfolio: {question}")
     return {"recorded": "ok"}
 
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
-_record_user_details_json = {
-    "name": "record_user_details",
-    "description": (
-        "Use this tool to record that a visitor is interested in getting in touch "
-        "and has provided their email address."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "email": {
-                "type": "string",
-                "description": "The visitor's email address",
-            },
-            "name": {
-                "type": "string",
-                "description": "The visitor's name, if they provided it",
-            },
-            "notes": {
-                "type": "string",
-                "description": "Any extra context about the conversation worth recording",
-            },
-        },
-        "required": ["email"],
-        "additionalProperties": False,
-    },
-}
-
-_record_unknown_question_json = {
-    "name": "record_unknown_question",
-    "description": (
-        "Always use this tool to record any question you could not answer "
-        "because you didn't know the answer."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The question that couldn't be answered",
-            },
-        },
-        "required": ["question"],
-        "additionalProperties": False,
-    },
-}
-
 TOOLS = [
-    {"type": "function", "function": _record_user_details_json},
-    {"type": "function", "function": _record_unknown_question_json},
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_details",
+            "description": (
+                "Get full details for one or more projects by name. "
+                "Use this when the user mentions a project by name or you know exactly "
+                "which project(s) they are asking about. "
+                "Known projects: Sofia, MotionX, Groceria, QuickRef, AnoNote, CropDisease."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of project names, e.g. [\"Sofia\", \"Groceria\"]",
+                    }
+                },
+                "required": ["names"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_projects",
+            "description": (
+                "Search for projects using a semantic description when you don't know "
+                "the specific project name. Use this as a fallback when the user describes "
+                "something like 'games you built', 'computer vision projects', "
+                "'multi-agent systems', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A description of what the user is looking for",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many projects to return (default 3, max 6)",
+                        "default": 3,
+                    },
+                },
+                "required": ["description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_user_details",
+            "description": "Record that a visitor wants to stay in touch and has provided their email address.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string", "description": "The visitor's email address"},
+                    "name":  {"type": "string", "description": "The visitor's name, if provided"},
+                    "notes": {"type": "string", "description": "Any useful context about the conversation"},
+                },
+                "required": ["email"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_unknown_question",
+            "description": "Record any question you could not answer because you didn't know the answer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question that couldn't be answered"},
+                },
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
-# ── Agent class ───────────────────────────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────────────────────
 
 class SulithaAgent:
 
@@ -136,91 +234,120 @@ class SulithaAgent:
         self.name   = "Sulitha Nulaksha Bandara"
         self.openai = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-        logger.info(f"Embedding {len(DOCUMENTS)} knowledge chunks via OpenAI...")
-        self._doc_chunks = DOCUMENTS
-        embeddings = self._embed_texts(DOCUMENTS)
+        # Build FAISS index once at startup
+        logger.info("Building project FAISS index...")
+        search_entries     = get_all_search_texts()
+        self._project_keys = [k for k, _ in search_entries]
+        texts              = [t for _, t in search_entries]
 
-        dim = embeddings.shape[1]
-        self._index = faiss.IndexFlatL2(dim)
-        self._index.add(embeddings)
-        logger.info(f"FAISS index built: {self._index.ntotal} vectors, dim={dim}")
+        sync_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        response    = sync_client.embeddings.create(model=EMBED_MODEL, input=texts)
+        vecs        = np.array([d.embedding for d in response.data], dtype=np.float32)
 
-    # ── Embeddings (OpenAI) ───────────────────────────────────────────────────
+        self._index = faiss.IndexFlatL2(vecs.shape[1])
+        self._index.add(vecs)
+        logger.info(f"Project FAISS index ready: {self._index.ntotal} projects, dim={vecs.shape[1]}")
 
-    def _embed_texts(self, texts: list[str]) -> np.ndarray:
-        """Embed a list of texts using OpenAI embeddings. Returns float32 array."""
-        # Use a sync client just for the startup index build
-        from openai import OpenAI as SyncOpenAI
-        client = SyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-        response = client.embeddings.create(model=EMBED_MODEL, input=texts)
-        vecs = np.array([d.embedding for d in response.data], dtype=np.float32)
-        return vecs
+    # ── FAISS search ──────────────────────────────────────────────────────────
 
-    # ── RAG ───────────────────────────────────────────────────────────────────
+    def faiss_search(self, description: str, top_n: int = DEFAULT_TOP_N) -> str:
+        sync_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        response    = sync_client.embeddings.create(model=EMBED_MODEL, input=[description])
+        q_vec       = np.array([response.data[0].embedding], dtype=np.float32)
 
-    async def _retrieve(self, query: str, k: int = TOP_K_CHUNKS) -> str:
-        """Embed query via OpenAI, search FAISS, return top-k chunks."""
-        response = await self.openai.embeddings.create(model=EMBED_MODEL, input=[query])
-        q_vec = np.array([response.data[0].embedding], dtype=np.float32)
-        _, idxs = self._index.search(q_vec, k)
-        chunks = [self._doc_chunks[i] for i in idxs[0] if i < len(self._doc_chunks)]
-        return "\n\n---\n\n".join(chunks)
+        top_n    = min(top_n, len(self._project_keys))
+        _, idxs  = self._index.search(q_vec, top_n)
+
+        matched = [self._project_keys[i] for i in idxs[0] if i < len(self._project_keys)]
+        return get_by_names(matched)
 
     # ── System prompt ─────────────────────────────────────────────────────────
 
-    def _system_prompt(self, rag_context: str) -> str:
+    def _system_prompt(self) -> str:
         return (
-            f"You are acting as {self.name}. You are answering questions on "
-            f"{self.name}'s personal portfolio website — questions about career, "
-            f"background, projects, skills, and experience. Represent {self.name} "
-            f"faithfully. Speak in first person, naturally and confidently. "
-            f"Be professional and engaging, as if talking to a potential employer "
-            f"or collaborator who came across the portfolio.\n\n"
-            f"If you don't know the answer to a question, use your "
-            f"record_unknown_question tool to record it.\n"
-            f"If the visitor seems interested in getting in touch, ask for their "
-            f"email and record it using record_user_details.\n\n"
-            f"## Relevant profile context:\n{rag_context}\n\n"
-            f"With this context, chat with the visitor, always staying in character "
-            f"as {self.name}."
+            f"You are acting as {self.name}, speaking directly with visitors on your "
+            f"personal portfolio website. Answer questions about your career, projects, "
+            f"skills, and background. Be professional, engaging, and concise.\n\n"
+            f"If a visitor asks about a specific project, call get_project_details. "
+            f"If they describe something without naming a project, call search_projects. "
+            f"If you genuinely cannot answer something, call record_unknown_question. "
+            f"If a visitor seems interested in getting in touch, ask for their email and "
+            f"call record_user_details.\n\n"
+            f"## Your Profile\n{PROFILE_SUMMARY}"
         )
 
     # ── Tool dispatcher ───────────────────────────────────────────────────────
 
     def handle_tool_call(self, tool_calls) -> list[dict]:
         results = []
-        for tool_call in tool_calls:
-            tool_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
-            logger.info(f"Tool called: {tool_name} with {arguments}")
-            tool_fn = globals().get(tool_name)
-            result  = tool_fn(**arguments) if tool_fn else {"error": "unknown tool"}
+        for tc in tool_calls:
+            name      = tc.function.name
+            arguments = json.loads(tc.function.arguments)
+            logger.info(f"Tool called: {name}({arguments})")
+            fn     = globals().get(name)
+            result = fn(**arguments) if fn else {"error": f"unknown tool: {name}"}
             results.append({
-                "role":        "tool",
-                "content":     json.dumps(result),
-                "tool_call_id": tool_call.id,
+                "role":         "tool",
+                "content":      json.dumps(result),
+                "tool_call_id": tc.id,
             })
         return results
 
-    # ── Chat ──────────────────────────────────────────────────────────────────
+    # ── Response evaluation ───────────────────────────────────────────────────
+
+    async def _evaluate(self, reply: str, message: str) -> Evaluation:
+        """Use gpt-4.1-nano to evaluate the reply against quality rules."""
+        response = await self.openai.beta.chat.completions.parse(
+            model           = EVAL_MODEL,
+            messages        = [
+                {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
+                {"role": "user",   "content": _evaluator_user_prompt(reply, message)},
+            ],
+            response_format = Evaluation,
+        )
+        return response.choices[0].message.parsed
+
+    async def _rerun(self, reply: str, message: str, history: list, feedback: str) -> str:
+        """Ask GPT-4o-mini to fix the reply based on evaluator feedback."""
+        fix_instruction = (
+            f"Your previous reply did not meet the quality rules.\n"
+            f"Feedback: {feedback}\n\n"
+            f"Previous reply: {reply}\n\n"
+            f"Please rewrite the reply fixing all issues mentioned in the feedback. "
+            f"Remember: plain text only, no markdown, no emojis, maximum 4 sentences."
+        )
+        messages = (
+            [{"role": "system", "content": self._system_prompt()}]
+            + history
+            + [{"role": "user",      "content": message}]
+            + [{"role": "assistant", "content": reply}]
+            + [{"role": "user",      "content": fix_instruction}]
+        )
+        response = await self.openai.chat.completions.create(
+            model       = OPENAI_MODEL,
+            messages    = messages,
+            max_tokens  = MAX_TOKENS,
+            temperature = 0.3,   # lower temp for correction pass
+        )
+        return response.choices[0].message.content.strip()
+
+    # ── Main chat ─────────────────────────────────────────────────────────────
 
     async def chat(self, message: str, session_id: str) -> str:
         if session_store.is_over_limit(session_id):
             return SESSION_LIMIT_REPLY
 
-        rag_context = await self._retrieve(message)
-        history     = session_store.get_history(session_id)
-
+        history  = session_store.get_history(session_id)
         messages = (
-            [{"role": "system", "content": self._system_prompt(rag_context)}]
+            [{"role": "system", "content": self._system_prompt()}]
             + history
             + [{"role": "user", "content": message}]
         )
 
-        done = False
+        # 1. Main agent loop (handles tool calls)
         response = None
         try:
-            while not done:
+            while True:
                 response = await self.openai.chat.completions.create(
                     model       = OPENAI_MODEL,
                     messages    = messages,
@@ -234,15 +361,28 @@ class SulithaAgent:
                     messages.append(assistant_msg)
                     messages.extend(tool_results)
                 else:
-                    done = True
+                    break
         except Exception as e:
             logger.error(f"OpenAI call failed: {e}")
             return (
-                "Sorry, I'm having a bit of a technical hiccup right now. "
-                "Feel free to email me directly at nulakshastudy19@gmail.com!"
+                "Sorry, I am having a technical issue right now. "
+                "Feel free to email me directly at nulakshastudy19@gmail.com."
             )
 
         reply = response.choices[0].message.content.strip()
+
+        # 2. Evaluate and rerun if needed
+        try:
+            evaluation = await self._evaluate(reply, message)
+            if evaluation.is_acceptable:
+                logger.info("Evaluation passed.")
+            else:
+                logger.info(f"Evaluation failed — retrying. Feedback: {evaluation.feedback}")
+                reply = await self._rerun(reply, message, history, evaluation.feedback)
+        except Exception as e:
+            logger.warning(f"Evaluation step failed — using original reply. Error: {e}")
+
+        # 3. Save and return
         session_store.append(session_id, "user",      message)
         session_store.append(session_id, "assistant", reply)
         return reply
@@ -254,7 +394,6 @@ _agent: SulithaAgent | None = None
 
 
 def build_index() -> None:
-    """Called once at app startup. Initialises the agent and FAISS index."""
     global _agent
     _agent = SulithaAgent()
 
